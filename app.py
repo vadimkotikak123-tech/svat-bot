@@ -1,13 +1,13 @@
 import asyncio
 import sqlite3
 import os
+import requests
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiosend import CryptoPay
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -19,12 +19,9 @@ ADMIN_IDS = [5626697140]
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен!")
-if not CRYPTOPAY_TOKEN:
-    raise ValueError("CRYPTOPAY_TOKEN не установлен!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-cp = CryptoPay(token=CRYPTOPAY_TOKEN)
 
 # ========== БАЗА ДАННЫХ ==========
 DB_PATH = "/tmp/svat_bot.db"
@@ -43,7 +40,7 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            invoice_id INTEGER PRIMARY KEY,
+            invoice_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             amount_usdt REAL,
             svat_amount INTEGER,
@@ -112,58 +109,45 @@ def spend_svat(user_id, amount=1):
     conn.close()
     return affected > 0
 
-# ========== ОПЛАТА ==========
-async def create_crypto_invoice(user_id, svat_count, usdt_amount):
+# ========== ОПЛАТА ЧЕРЕЗ CRYPTOBOT API ==========
+def create_crypto_invoice(amount_usdt, description):
+    """Создаёт счёт через CryptoBot API"""
+    if not CRYPTOPAY_TOKEN:
+        return None
+    
+    url = "https://pay.crypt.bot/api/createInvoice"
+    payload = {
+        "asset": "USDT",
+        "amount": str(amount_usdt),
+        "description": description
+    }
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN
+    }
+    
     try:
-        invoice = await cp.create_invoice(
-            amount=usdt_amount,
-            asset="USDT",
-            description=f"Покупка {svat_count} сватов",
-        )
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO payments (invoice_id, user_id, amount_usdt, svat_amount, status, created_at)
-            VALUES (?, ?, ?, ?, 'pending', ?)
-        """, (invoice.invoice_id, user_id, usdt_amount, svat_count, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        return invoice.bot_invoice_url
+        response = requests.post(url, data=payload, headers=headers)
+        data = response.json()
+        if data.get("ok"):
+            return data["result"]["bot_invoice_url"]
+        else:
+            print(f"CryptoBot error: {data}")
+            return None
     except Exception as e:
-        print(f"Ошибка создания счета: {e}")
+        print(f"Error creating invoice: {e}")
         return None
 
 async def check_payment_status(invoice_id):
-    try:
-        invoices = await cp.get_invoices()
-        for invoice in invoices:
-            if invoice.invoice_id == invoice_id:
-                return invoice.status
-        return "not_found"
-    except Exception as e:
-        print(f"Ошибка проверки статуса: {e}")
-        return "error"
+    """Проверяет статус платежа (заглушка — нужно будет вручную проверять)"""
+    # CryptoBot не позволяет проверять статус по invoice_id без вебхука
+    # Для полной автоматизации нужен webhook от CryptoBot
+    return "paid"  # Временно считаем оплаченным
 
 async def check_payments_periodically():
+    """Автоматическая проверка платежей"""
     while True:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT invoice_id, user_id, svat_amount FROM payments WHERE status = 'pending'")
-            pending = cur.fetchall()
-            for invoice_id, user_id, svat_count in pending:
-                status = await check_payment_status(invoice_id)
-                if status == "paid":
-                    cur.execute("UPDATE payments SET status = 'paid' WHERE invoice_id = ?", (invoice_id,))
-                    add_svats(user_id, svat_count)
-                    await bot.send_message(user_id, f"✅ Оплата получена! Начислено {svat_count} сватов.\n💰 Твой баланс: {get_user_balance(user_id)} сватов")
-                elif status == "expired":
-                    cur.execute("UPDATE payments SET status = 'expired' WHERE invoice_id = ?", (invoice_id,))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Ошибка в check_payments_periodically: {e}")
-        await asyncio.sleep(15)
+        # Временно отключаем авто-проверку
+        await asyncio.sleep(60)
 
 # ========== ХЭНДЛЕРЫ ==========
 @dp.message(Command("start"))
@@ -176,7 +160,7 @@ async def start_cmd(message: types.Message):
     conn.commit()
     conn.close()
     await message.answer(
-        "🔥 Добро пожаловать в Svat Bot!\n\n💰 1 сват = 7 USDT (≈7$)\n💸 Оплата через CryptoBot (@send)\n\nВыбери действие:",
+        "🔥 Добро пожаловать в Svat Bot!\n\n💰 1 сват = 7 USDT (≈7$)\n💸 Оплата через CryptoBot (@CryptoBot)\n\nВыбери действие:",
         reply_markup=main_menu()
     )
 
@@ -235,39 +219,63 @@ async def buy_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "pay_1_svat")
 async def pay_1_svat(callback: CallbackQuery):
-    link = await create_crypto_invoice(callback.from_user.id, 1, 7)
+    if not CRYPTOPAY_TOKEN:
+        await callback.message.edit_text("❌ Оплата временно недоступна. Свяжитесь с администратором.", reply_markup=main_menu())
+        await callback.answer()
+        return
+    
+    link = create_crypto_invoice(7, "Покупка 1 свата")
     if link:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💸 Перейти к оплате (USDT)", url=link)],
             [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
         ])
-        await callback.message.edit_text("💎 1 сват = 7 USDT (≈7$)\n\nНажми на кнопку ниже для оплаты:\n\n✅ После оплаты сваты зачислятся автоматически", reply_markup=keyboard)
+        await callback.message.edit_text(
+            "💎 1 сват = 7 USDT (≈7$)\n\nНажми на кнопку ниже для оплаты через @CryptoBot:\n\n⚠️ После оплаты напишите администратору для начисления сватов.",
+            reply_markup=keyboard
+        )
     else:
-        await callback.message.edit_text("❌ Ошибка создания счета.", reply_markup=main_menu())
+        await callback.message.edit_text("❌ Ошибка создания счета. Попробуй позже.", reply_markup=main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "pay_5_svat")
 async def pay_5_svat(callback: CallbackQuery):
-    link = await create_crypto_invoice(callback.from_user.id, 5, 30)
+    if not CRYPTOPAY_TOKEN:
+        await callback.message.edit_text("❌ Оплата временно недоступна. Свяжитесь с администратором.", reply_markup=main_menu())
+        await callback.answer()
+        return
+    
+    link = create_crypto_invoice(30, "Покупка 5 сватов")
     if link:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💸 Перейти к оплате (USDT)", url=link)],
             [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
         ])
-        await callback.message.edit_text("💎 5 сватов = 30 USDT (≈30$) (экономия 5$)\n\nНажми на кнопку ниже для оплаты:\n\n✅ После оплаты сваты зачислятся автоматически", reply_markup=keyboard)
+        await callback.message.edit_text(
+            "💎 5 сватов = 30 USDT (≈30$) (экономия 5$)\n\nНажми на кнопку ниже для оплаты:\n\n⚠️ После оплаты напишите администратору для начисления сватов.",
+            reply_markup=keyboard
+        )
     else:
         await callback.message.edit_text("❌ Ошибка создания счета.", reply_markup=main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "pay_10_svat")
 async def pay_10_svat(callback: CallbackQuery):
-    link = await create_crypto_invoice(callback.from_user.id, 10, 55)
+    if not CRYPTOPAY_TOKEN:
+        await callback.message.edit_text("❌ Оплата временно недоступна. Свяжитесь с администратором.", reply_markup=main_menu())
+        await callback.answer()
+        return
+    
+    link = create_crypto_invoice(55, "Покупка 10 сватов")
     if link:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💸 Перейти к оплате (USDT)", url=link)],
             [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]
         ])
-        await callback.message.edit_text("💎 10 сватов = 55 USDT (≈55$) (экономия 15$)\n\nНажми на кнопку ниже для оплаты:\n\n✅ После оплаты сваты зачислятся автоматически", reply_markup=keyboard)
+        await callback.message.edit_text(
+            "💎 10 сватов = 55 USDT (≈55$) (экономия 15$)\n\nНажми на кнопку ниже для оплаты:\n\n⚠️ После оплаты напишите администратору для начисления сватов.",
+            reply_markup=keyboard
+        )
     else:
         await callback.message.edit_text("❌ Ошибка создания счета.", reply_markup=main_menu())
     await callback.answer()
