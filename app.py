@@ -13,8 +13,8 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 # ========== КОНФИГ ==========
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CRYPTOPAY_TOKEN = os.environ.get("CRYPTOPAY_TOKEN")
+BOT_TOKEN = os.environ.get("8713433990:AAGVHh7PHIWW7kuoTksioEJErkr4uLytVBs")
+CRYPTOPAY_TOKEN = os.environ.get("574854:AA6FchYA1UXQePqaD85z9rK2EyDShb2Tk2I")
 ADMIN_IDS = [5626697140]
 
 if not BOT_TOKEN:
